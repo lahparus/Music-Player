@@ -22,6 +22,7 @@ const int BUTTON_PIN = 0;               // BOOT button
 const uint32_t DEBOUNCE_MS = 30;
 const uint32_t LONG_PRESS_MS = 600;
 const int BT_VOLUME = 127;               // 0 to 127
+const int LED_PIN = 2;                         // optional: built-in LED to show Bluetooth status
 
 // Fake tracks. Each plays its own pitch (in Hz). Later these come from the SD card.
 const char *titles[] = {"test tone 1", "test tone 2", "test tone 3",
@@ -188,10 +189,12 @@ void drawNowPlaying() {
 // ---------- main program ----------
 void setup() {
   Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   tft.init();
   tft.setRotation(1);
+  digitalWrite(LED_PIN, LOW);
   drawList();
 
   // Start Bluetooth last. It scans in the background while the screen works.
@@ -255,6 +258,8 @@ void loop() {
   static uint32_t troubleSince = 0;
 
   if (millis() - lastCheck >= 1000) {
+    if (btConnected) digitalWrite(LED_PIN, streamAlive ? HIGH : LOW);
+    else digitalWrite(LED_PIN, LOW);
     lastCheck = millis();
     uint32_t calls = dataCalls;
     streamAlive = (calls != lastCalls);
@@ -282,6 +287,7 @@ void loop() {
 
   if (linkOk != btConnected) {  // update the screen label only when it changes
     btConnected = linkOk;
+    digitalWrite(LED_PIN, btConnected ? HIGH : LOW);
     drawBtStatus();
   }
 }
