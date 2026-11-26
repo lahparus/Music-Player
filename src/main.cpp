@@ -1,11 +1,14 @@
-// Music player skeleton: UI + Bluetooth audio together.
-// Each fake "track" plays a different steady tone, so you can hear the player
-// working. Real music from the SD card replaces the tones later.
+// Music player skeleton: display + Bluetooth audio + 3 buttons + status LED.
+// Each fake "track" plays a different steady tone. Real music from the SD card
+// replaces the tones later.
 // Rename this to main.cpp and put it in the src/ folder of your PlatformIO project.
 //
-// Controls use the BOOT button on the ESP32 (GPIO0):
-//   Track list:   short press = move down,   long press (hold ~0.6 s) = play selected
-//   Now playing:  short press = pause/play,  long press = back to track list
+// BUTTONS (each wired between its pin and GND):
+//   PLAY  (BOOT button, GPIO0)  short = select / play-pause     hold = back to list
+//   PREV  (GPIO12)              short = up / previous track     hold = volume down
+//   NEXT  (GPIO15)              short = down / next track       hold = volume up
+//
+// LED: GPIO2 (the blue LED on most ESP32 boards) lights up while Bluetooth is connected.
 //
 // Don't hold BOOT while pressing RST or plugging in power.
 
@@ -14,19 +17,28 @@
 #include "BluetoothA2DPSource.h"
 
 // ---------- settings ----------
-// Name (or part of the name) of your Bluetooth speaker. Put it in pairing mode,
-// run once, and read its exact name in the Serial Monitor ("Found Bluetooth device:").
-const char *TARGET_NAME = "UE BOOM 2";
+// Put the names (or part of the names) of your Bluetooth speakers/headphones here.
+// The ESP32 scans, and connects to the FIRST device it finds whose name contains
+// any of these. The order of this list does not set priority.
+const char *TARGET_NAMES[] = {"UE BOOM 2", "AirFall"};
+const int NUM_TARGETS = sizeof(TARGET_NAMES) / sizeof(TARGET_NAMES[0]);
 
-const int BUTTON_PIN = 0;               // BOOT button
+const int PIN_PLAY = 0;     // BOOT button
+const int PIN_PREV = 12;
+const int PIN_NEXT = 15;
+const int PIN_LED = 2;      // Bluetooth-connected LED
+
 const uint32_t DEBOUNCE_MS = 30;
-const uint32_t LONG_PRESS_MS = 600;
-const int BT_VOLUME = 127;               // 0 to 127
-const int LED_PIN = 2;                         // optional: built-in LED to show Bluetooth status
+const uint32_t LONG_PRESS_MS = 300;   // hold this long = "hold"
+const uint32_t REPEAT_MS = 150;       // while still holding, repeat this often
+
+const int START_VOLUME = 0;          // 0 to 127
+const int MAX_VOLUME = 100;           // volume limit (keeps things safe)
+const int VOLUME_STEP = 6;
 
 // Fake tracks. Each plays its own pitch (in Hz). Later these come from the SD card.
-const char *titles[] = {"test tone 1", "test tone 2", "test tone 3",
-                        "test tone 4", "secret test tone 5 ohhhh"};
+const char *titles[] = {"Midnight Drive", "Paper Planes", "Slow Burn",
+                        "City Lights", "Static Dreams"};
 const int durations[] = {210, 185, 243, 198, 225};      // seconds
 const float tones[] = {262.0, 330.0, 392.0, 440.0, 523.0};
 const int NUM_TRACKS = 5;
@@ -47,6 +59,7 @@ bool playing = false;
 int elapsed = 0;        // seconds into the current track
 uint32_t lastTick = 0;
 bool btConnected = false;
+int volume = START_VOLUME;
 
 // Shared with the audio callback, which runs in a different task.
 // "volatile" tells the compiler these can change at any moment.
@@ -55,10 +68,19 @@ volatile float audioFreq = 440.0;
 volatile uint32_t dataCalls = 0;  // counts how often the library asks for audio
 
 // ---------- Bluetooth ----------
+// Called once for every Bluetooth device found while scanning.
+// Return true to connect to it, false to keep looking.
 bool isTarget(const char *ssid, esp_bd_addr_t address, int rssi) {
   Serial.print("Found Bluetooth device: ");
   Serial.println(ssid);
-  return strstr(ssid, TARGET_NAME) != nullptr;
+  for (int i = 0; i < NUM_TARGETS; i++) {
+    if (strstr(ssid, TARGET_NAMES[i]) != nullptr) {
+      Serial.print("  -> match, connecting to: ");
+      Serial.println(ssid);
+      return true;
+    }
+  }
+  return false;
 }
 
 // The library calls this whenever it needs more audio (44,100 samples/second,
@@ -79,30 +101,57 @@ int32_t get_data_frames(Frame *frame, int32_t frame_count) {
   return frame_count;
 }
 
-// ---------- button ----------
-// Returns 0 = nothing, 1 = short press, 2 = long press (reported on release).
-int readButton() {
-  static bool lastRaw = HIGH;
-  static bool stable = HIGH;
-  static uint32_t lastChange = 0;
-  static uint32_t pressedAt = 0;
+// ---------- buttons ----------
+struct Button {
+  uint8_t pin;
+  bool lastRaw;        // last reading of the pin
+  bool stable;         // debounced state (HIGH = released, LOW = pressed)
+  uint32_t lastChange; // when the raw reading last changed
+  uint32_t pressedAt;  // when the button went down
+  uint32_t lastRepeat; // when the last repeat event fired
+  bool holdFired;      // true once a "hold" has been reported for this press
+};
 
-  bool raw = digitalRead(BUTTON_PIN);
+Button btnPlay = {PIN_PLAY, HIGH, HIGH, 0, 0, 0, false};
+Button btnPrev = {PIN_PREV, HIGH, HIGH, 0, 0, 0, false};
+Button btnNext = {PIN_NEXT, HIGH, HIGH, 0, 0, 0, false};
+
+enum ButtonEvent {
+  EV_NONE,
+  EV_SHORT,   // quick press, reported when released
+  EV_HOLD,    // held down for LONG_PRESS_MS (reported once)
+  EV_REPEAT   // still held: fires every REPEAT_MS
+};
+
+ButtonEvent readButton(Button &b) {
+  bool raw = digitalRead(b.pin);
   uint32_t now = millis();
 
-  if (raw != lastRaw) {
-    lastChange = now;
-    lastRaw = raw;
+  if (raw != b.lastRaw) {  // pin changed: restart the debounce timer
+    b.lastChange = now;
+    b.lastRaw = raw;
   }
-  if (now - lastChange > DEBOUNCE_MS && raw != stable) {
-    stable = raw;
-    if (stable == LOW) {
-      pressedAt = now;
-    } else {
-      return (now - pressedAt >= LONG_PRESS_MS) ? 2 : 1;
+  if (now - b.lastChange > DEBOUNCE_MS && raw != b.stable) {
+    b.stable = raw;
+    if (b.stable == LOW) {  // button went down
+      b.pressedAt = now;
+      b.holdFired = false;
+    } else {                // button came back up
+      return b.holdFired ? EV_NONE : EV_SHORT;
     }
   }
-  return 0;
+  if (b.stable == LOW) {    // still being held
+    if (!b.holdFired && now - b.pressedAt >= LONG_PRESS_MS) {
+      b.holdFired = true;
+      b.lastRepeat = now;
+      return EV_HOLD;
+    }
+    if (b.holdFired && now - b.lastRepeat >= REPEAT_MS) {
+      b.lastRepeat = now;
+      return EV_REPEAT;
+    }
+  }
+  return EV_NONE;
 }
 
 // ---------- drawing ----------
@@ -114,6 +163,14 @@ void drawBtStatus() {
   tft.setTextSize(1);
   tft.setTextColor(btConnected ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
   tft.drawString(btConnected ? "BT: connected" : "BT: searching", 220, 12);
+}
+
+void drawVolume() {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "Vol: %3d%%   ", volume * 100 / 127);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(buf, 220, 26);
 }
 
 void drawList() {
@@ -132,14 +189,15 @@ void drawList() {
     tft.drawString(titles[i], 14, y + 7);
     if (i == playingTrack && playing) {
       tft.setTextColor(TFT_GREEN, bg);
-      tft.drawString(">", 290, y + 7);
+      tft.drawString(">", 290, y + 7);  // marks the track that is playing
     }
   }
 
   tft.setTextSize(1);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("Click: next    Hold: play", 10, 225);
+  tft.drawString("Prev/Next: move   Play: select   Hold Prev/Next: volume", 10, 225);
   drawBtStatus();
+  drawVolume();
 }
 
 void drawStatus() {
@@ -182,75 +240,97 @@ void drawNowPlaying() {
 
   tft.setTextSize(1);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("Click: pause/play    Hold: back", 10, 225);
+  tft.drawString("Play: pause   Prev/Next: track   Hold Play: list", 10, 225);
   drawBtStatus();
+  drawVolume();
 }
 
-// ---------- main program ----------
-void setup() {
-  Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  tft.init();
-  tft.setRotation(1);
-  digitalWrite(LED_PIN, LOW);
-  drawList();
-
-  // Start Bluetooth last. It scans in the background while the screen works.
-  a2dp_source.set_ssid_callback(isTarget);
-  a2dp_source.set_data_callback_in_frames(get_data_frames);
-  a2dp_source.set_volume(BT_VOLUME);
-  a2dp_source.start();
+// ---------- player actions ----------
+void startTrack(int index) {
+  playingTrack = index;
+  elapsed = 0;
+  playing = true;
+  lastTick = millis();
 }
 
-void loop() {
-  // 1) Handle button presses
-  int press = readButton();
-  if (press == 1) {  // short press
+void changeVolume(int delta) {
+  volume = constrain(volume + delta, 0, MAX_VOLUME);
+  a2dp_source.set_volume(volume);
+  drawVolume();
+}
+
+void handleButtons() {
+  ButtonEvent ePlay = readButton(btnPlay);
+  ButtonEvent ePrev = readButton(btnPrev);
+  ButtonEvent eNext = readButton(btnNext);
+
+  // PLAY button
+  if (ePlay == EV_SHORT) {
     if (screen == SCREEN_LIST) {
-      selected = (selected + 1) % NUM_TRACKS;
-      drawList();
+      startTrack(selected);
+      screen = SCREEN_NOW;
+      drawNowPlaying();
     } else {
       playing = !playing;
       lastTick = millis();
       drawStatus();
     }
-  } else if (press == 2) {  // long press
-    if (screen == SCREEN_LIST) {
-      playingTrack = selected;
-      elapsed = 0;
-      playing = true;
-      lastTick = millis();
-      screen = SCREEN_NOW;
-      drawNowPlaying();
-    } else {
-      selected = playingTrack;
-      screen = SCREEN_LIST;
-      drawList();
-    }
+  } else if (ePlay == EV_HOLD && screen == SCREEN_NOW) {
+    selected = playingTrack;
+    screen = SCREEN_LIST;
+    drawList();
   }
 
-  // 2) Advance the playback clock once per second
+  // PREV button
+  if (ePrev == EV_SHORT) {
+    if (screen == SCREEN_LIST) {
+      selected = (selected + NUM_TRACKS - 1) % NUM_TRACKS;
+      drawList();
+    } else if (elapsed > 3) {  // more than 3 s in: restart this track
+      elapsed = 0;
+      drawProgress();
+    } else {
+      startTrack((playingTrack + NUM_TRACKS - 1) % NUM_TRACKS);
+      selected = playingTrack;
+      drawNowPlaying();
+    }
+  } else if (ePrev == EV_HOLD || ePrev == EV_REPEAT) {
+    changeVolume(-VOLUME_STEP);
+  }
+
+  // NEXT button
+  if (eNext == EV_SHORT) {
+    if (screen == SCREEN_LIST) {
+      selected = (selected + 1) % NUM_TRACKS;
+      drawList();
+    } else {
+      startTrack((playingTrack + 1) % NUM_TRACKS);
+      selected = playingTrack;
+      drawNowPlaying();
+    }
+  } else if (eNext == EV_HOLD || eNext == EV_REPEAT) {
+    changeVolume(VOLUME_STEP);
+  }
+}
+
+// Advance the playback clock once per second.
+void tickClock() {
   if (playing && millis() - lastTick >= 1000) {
     lastTick += 1000;
     elapsed++;
     if (elapsed >= durations[playingTrack]) {  // track finished: next one
-      playingTrack = (playingTrack + 1) % NUM_TRACKS;
-      elapsed = 0;
+      startTrack((playingTrack + 1) % NUM_TRACKS);
       if (screen == SCREEN_NOW) drawNowPlaying();
+      else drawList();
     } else if (screen == SCREEN_NOW) {
       drawProgress();
     }
   }
+}
 
-  // 3) Tell the audio side what to play
-  audioOn = playing;
-  audioFreq = tones[playingTrack];
-
-  // 4) Check the Bluetooth link. is_connected() can keep saying "yes" after the
-  //    speaker drops, so we also check that the library is still asking us for
-  //    audio. While the link is healthy that happens about 100 times a second.
+// Check the Bluetooth link. is_connected() can keep saying "yes" after the
+// speaker drops, so we also check that the library is still asking us for audio.
+void checkBluetooth() {
   static uint32_t lastCheck = 0;
   static uint32_t lastCalls = 0;
   static bool streamAlive = false;
@@ -258,8 +338,6 @@ void loop() {
   static uint32_t troubleSince = 0;
 
   if (millis() - lastCheck >= 1000) {
-    if (btConnected) digitalWrite(LED_PIN, streamAlive ? HIGH : LOW);
-    else digitalWrite(LED_PIN, LOW);
     lastCheck = millis();
     uint32_t calls = dataCalls;
     streamAlive = (calls != lastCalls);
@@ -275,7 +353,7 @@ void loop() {
     troubleSince = 0;
   } else if (everConnected) {
     // The link worked before and now it doesn't. Give it 10 seconds to recover,
-    // then restart the ESP32 so it scans for the speaker again.
+    // then restart the ESP32 so it scans again.
     if (troubleSince == 0) {
       troubleSince = millis();
     } else if (millis() - troubleSince > 10000) {
@@ -285,9 +363,42 @@ void loop() {
     }
   }
 
-  if (linkOk != btConnected) {  // update the screen label only when it changes
+  if (linkOk != btConnected) {  // update screen label and LED only when it changes
     btConnected = linkOk;
-    digitalWrite(LED_PIN, btConnected ? HIGH : LOW);
+    digitalWrite(PIN_LED, btConnected ? HIGH : LOW);
     drawBtStatus();
   }
+}
+
+// ---------- main program ----------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_PLAY, INPUT_PULLUP);  // buttons: pressed = LOW
+  pinMode(PIN_PREV, INPUT_PULLUP);
+  pinMode(PIN_NEXT, INPUT_PULLUP);
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+
+  tft.init();
+  tft.setRotation(1);
+  drawList();
+
+  // Start Bluetooth last. It scans in the background while the screen works.
+  a2dp_source.set_ssid_callback(isTarget);
+  a2dp_source.set_data_callback_in_frames(get_data_frames);
+  a2dp_source.set_volume(volume);
+  a2dp_source.set_auto_reconnect(true);
+  a2dp_source.start();
+}
+
+void loop() {
+  handleButtons();
+  tickClock();
+
+  // Tell the audio side what to play
+  audioOn = playing;
+  audioFreq = tones[playingTrack];
+
+  checkBluetooth();
 }
